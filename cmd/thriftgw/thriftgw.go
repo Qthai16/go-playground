@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Qthai16/go-playground/cmd/thriftgw/gwstat"
 	"github.com/Qthai16/go-playground/cmd/thriftgw/message"
 	"github.com/Qthai16/go-playground/cmd/thriftgw/proxyclient"
 	"github.com/Qthai16/go-playground/common/pool"
@@ -18,12 +20,6 @@ import (
 	"github.com/apache/thrift/lib/go/thrift"
 	"github.com/sevlyar/go-daemon"
 )
-
-// todo: rotation log file
-// todo: use buffer pool
-// todo: http proxy
-// todo: flag init proxy authentication, eg: auth za:12345 for proxy
-// todo: get remote addr and write to log
 
 var (
 	connConf *thrift.TConfiguration = &thrift.TConfiguration{ // pool client connection config
@@ -35,6 +31,7 @@ var (
 	}
 	transFactory thrift.TTransportFactory = thrift.NewTFramedTransportFactoryConf(thrift.NewTBufferedTransportFactory(8192), nil)
 	protoFactory thrift.TProtocolFactory  = thrift.NewTBinaryProtocolFactoryConf(nil)
+	stats                                 = gwstat.NewGWStats()
 	cmdLineOpts                           = CmdlineOpts{}
 )
 
@@ -85,16 +82,19 @@ func doHandleConn(ctx context.Context, inMessage *message.ThriftMessage, clientP
 		// fmt.Println("[debug]: client close connection")
 		return
 	}
+	stats.AddMethodStat(inMessage.Header.Addr, inMessage.Header.Name)
 	var clientPool *proxyclient.ProxyThriftClientPool
 	if clientPool = clientPoolMap.GetPool(inMessage.Header.Addr); clientPool == nil {
 		clientPool, err = proxyclient.NewProxyThriftClientPool(inMessage.Header.Addr, connConf)
 		if err != nil {
+			stats.IncPoolCreateErr()
 			return err
 		}
 		clientPoolMap.PutPool(inMessage.Header.Addr, clientPool)
 	}
 	client, err := clientPool.Pool.Get()
 	if err != nil {
+		stats.IncPoolGetErr()
 		if errors.Is(err, pool.ErrNoConnection) {
 			// fmt.Printf("failed to dial to dest addr, err: %v\n", err)
 			transErr := thrift.NewTTransportException(thrift.NOT_OPEN, proxyclient.PrependProxyError(err).Error())
@@ -109,6 +109,13 @@ func doHandleConn(ctx context.Context, inMessage *message.ThriftMessage, clientP
 }
 
 func handleConn(ctx context.Context, client thrift.TTransport) {
+	if client.(*thrift.TSocket) != nil {
+		conn := client.(*thrift.TSocket).Conn()
+		rmtAddrStr := conn.RemoteAddr().String()
+		fmt.Printf("got conn from remote: %v\n", rmtAddrStr)
+		// stats.AddRemote(rmtAddrStr)
+		// defer stats.DelRemote(rmtAddrStr)
+	}
 	// todo: configure different factory for in and out
 	var inTransport, outTransport thrift.TTransport
 	var err error
@@ -168,10 +175,34 @@ func startThriftServer(ctx context.Context, addr string) {
 	}
 }
 
+func printStats(ctx context.Context, f *os.File) {
+	ticker := time.NewTicker(3 * time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			ticker.Stop()
+			return
+		case <-ticker.C:
+			if jsonstr, err := json.Marshal(stats); err == nil {
+				f.Write(jsonstr)
+			} else {
+				f.WriteString(stats.String())
+			}
+			f.WriteString("\n")
+		}
+	}
+}
+
 func uniqPidFile() string {
 	src := rand.NewSource(time.Now().UnixNano())
 	r := rand.New(src)
-	return fmt.Sprintf("thriftgw.%d.pid", r.Intn(10000))
+	f := fmt.Sprintf("/tmp/zodbgw.%d.pid", r.Intn(1000))
+	for st, err := os.Stat(f); err == nil && !st.IsDir(); {
+		// fmt.Printf("file exist: %v, retrying\n", f)
+		f = fmt.Sprintf("/tmp/zodbgw.%d.pid", r.Intn(1000))
+		st, err = os.Stat(f)
+	}
+	return f
 }
 
 func run() {
@@ -192,6 +223,9 @@ func run() {
 		startThriftServer(ctx, cmdLineOpts.Addr)
 		cancel()
 	}()
+	go func() {
+		printStats(ctx, os.Stdout)
+	}()
 	select {
 	case <-ctx.Done():
 	case <-utils.WaitTerminate():
@@ -210,7 +244,7 @@ func main() {
 	if cmdLineOpts.Daemon {
 		utils.LogInfo("running process as daemon")
 		cntxt := &daemon.Context{
-			PidFileName: fmt.Sprintf("/tmp/%s", uniqPidFile()),
+			PidFileName: uniqPidFile(),
 			PidFilePerm: 0644,
 		}
 		d, err := cntxt.Reborn()
