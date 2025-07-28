@@ -196,10 +196,10 @@ func printStats(ctx context.Context, f *os.File) {
 func uniqPidFile() string {
 	src := rand.NewSource(time.Now().UnixNano())
 	r := rand.New(src)
-	f := fmt.Sprintf("/tmp/zodbgw.%d.pid", r.Intn(1000))
+	f := fmt.Sprintf("/tmp/thriftgw.%d.pid", r.Intn(1000))
 	for st, err := os.Stat(f); err == nil && !st.IsDir(); {
 		// fmt.Printf("file exist: %v, retrying\n", f)
-		f = fmt.Sprintf("/tmp/zodbgw.%d.pid", r.Intn(1000))
+		f = fmt.Sprintf("/tmp/thriftgw.%d.pid", r.Intn(1000))
 		st, err = os.Stat(f)
 	}
 	return f
